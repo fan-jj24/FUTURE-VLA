@@ -1,0 +1,217 @@
+# Training Pipeline
+
+This guide provides a complete walkthrough of the FUTURE-VLA training pipeline, using the LIBERO dataset as an example. The training process consists of three main stages: data preparation, visual tokenizer training, and unified VLA model training.
+
+---
+
+## 📦 Data Preparation
+
+First, download the LIBERO dataset from Hugging Face. This dataset contains multi-modal robot trajectories with visual observations and action sequences.
+
+### Download Dataset
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="physical-intelligence/libero",
+    repo_type="dataset",
+    local_dir="./libero_dataset",      
+    local_dir_use_symlinks=False,      
+    resume_download=True               
+)
+```
+
+### Convert to Training Format
+
+Transform the original parquet-based dataset into MS-Swift compatible JSONL format with sliding window samples:
+
+```bash
+python swift_trans_pall_libero.py \
+    --dataset_root /path/to/libero \
+    --name LIBERO \
+    --out_dir /path/to/output
+```
+
+This conversion script processes the data structure as follows:
+
+```text
+Input structure:
+A/
+  data/chunk-***/episode_******.parquet
+  meta/episodes.jsonl
+
+Output structure (out_dir):
+out_dir/
+  data/episode_******.jsonl
+  images/episode_******/A_image_episode_******_frame_******.png
+  images/episode_******/A_wrist_image_episode_******_frame_******.png
+```
+
+---
+
+## 🎨 Training of Compact 1D Visual Tokenizer
+
+After preparing the dataset, the next step is to train a compact 1D tokenizer (TiTok) for efficient visual representation. This tokenizer compresses high-dimensional images into discrete tokens, enabling efficient spatiotemporal modeling.
+
+### 🔧 Environment Setup
+
+Clone and install the 1D tokenizer repository with all required dependencies:
+
+```bash
+git clone https://github.com/bytedance/1d-tokenizer.git
+cd 1d-tokenizer
+pip install -r requirements.txt
+```
+
+### 📊 Data Preparation
+
+Convert the image dataset into WebDataset format for efficient parallel loading during training:
+
+```bash
+python convert_local_images_to_wds.py \
+    --input_dir /path/to/episodes \
+    --output_dir /path/to/output \
+    --overwrite
+```
+
+Split the dataset into training and validation sets (1% for validation):
+
+```bash
+python generate.py \
+    --data_dir /path/to/data \
+    --train_output train_files.txt \
+    --val_output val_files.txt \
+    --val_ratio 0.01
+```
+
+### 🏋️ Training
+
+Train the TiTok tokenizer in two stages for optimal performance:
+
+**Stage 1: Base tokenizer training**
+```bash
+bash stage1.sh
+```
+
+**Stage 2: Fine-tuning with decoder**
+```bash
+bash stage2.sh
+```
+
+---
+
+## 🤖 Training of FUTURE-VLA
+
+With the visual tokenizer trained, we now proceed to train the unified FUTURE-VLA model. This stage integrates the visual tokens with action sequences and trains the Qwen3-4B backbone for end-to-end robot control with future prediction capabilities.
+
+### 🔧 Environment Setup
+
+Install MS-Swift framework for efficient training:
+
+```bash
+pip install ms_swift==3.11.3
+```
+
+### 📊 Data Preparation
+
+**Step 1: Encode images to visual tokens**
+
+Use the trained TiTok tokenizer to convert all images into discrete token sequences. This multi-GPU script efficiently processes large-scale datasets:
+
+```bash
+torchrun --nproc_per_node=8 encode_titok_multi_gpu.py \
+    --a_dir /path/to/data \
+    --ckpt_dir /path/to/titok_checkpoint \
+    --batch_size 64 \
+    --num_workers 8 \
+    --check_every 500 \
+    --skip_existing
+```
+
+The tokenization generates the following directory structure:
+
+```text
+Directory structure:
+  a_dir/
+    ├── images/
+    │   ├── episode_000001/
+    │   │   ├── frame_001.png
+    │   │   └── ...
+    │   └── episode_000002/
+    └── TiToken/  (output directory, created automatically)
+        ├── episode_000001/
+        │   ├── frame_001.json  (contains 32-dimensional token)
+        │   └── ...
+        └── episode_000002/
+```
+
+**Step 2: Build final training data**
+
+Integrate visual tokens with action sequences and construct the final training format:
+
+```bash
+python build_ms_swift_fast_titoken.py \
+       --A /path/to/A \
+       --fast_repo /path/to/fast_tokenizer
+```
+
+This step produces the tokenized training data in MS-Swift format, combining vision and action modalities.
+
+### 💾 Data Format
+
+The final training data consists of two types of samples: **VLA (Vision-Language-Action)** and **WM (World Model)** format.
+
+**VLA Format (Observation → Action + Future):**
+```text
+role"user"
+content"<image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image>Task: put the white mug on the left plate and put the yellow and white mug on the right plate. Based on the images, what action should be executed?"
+
+role"assistant"
+content"The robot should execute<Act>300 496 1179 273 469 265 398 289 482 278 972 953 360 416 413 262 258</Act>, which will lead to the next state<Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 3010 60 3598 1683 1003 1543 615 2393 3730 4086 2406 4004 764 1721 951 3008 629 713 740 1972 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 1602 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 3010 60 3598 2788 1003 1543 615 2393 248 4086 2406 4004 764 1721 689 3008 629 3711 740 1972 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 954 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 565 60 3598 1683 1003 1543 615 2393 248 4086 2406 4004 764 1721 689 2786 629 3711 740 1972 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 954 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 565 60 3598 1669 1003 1543 615 2393 3730 4086 2406 4004 764 1721 689 3008 629 1944 740 3168 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1708 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2456 3588 3407 3426 703 2864 2298 2164 3010 60 3598 1683 1846 1543 615 2393 248 4086 2406 4004 764 1721 689 2786 629 713 963 1739 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 3412 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 652 703 2864 1024 2164 3010 60 3598 1669 1846 1543 615 2393 248 4086 2406 4004 764 1721 689 2786 629 713 963 1739 3331</Rec><Rec>621 3159 2367 55 3229 425 941 3997 3360 1543 2638 1332 362 1708 3227 3639 360 3172 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 282 823 3588 3407 2267 257 2864 1024 2164 3010 60 3598 1669 1846 1543 615 2393 248 4086 3511 708 3972 1721 689 2786 629 2983 1710 1739 3331</Rec><Rec>621 3159 2367 55 3229 425 941 3997 3360 1543 2638 3131 362 1708 3227 3639 360 1660 3095 175 263 1492 702 531 3863 3319 1289 2257 1029 1672 1360 1851</Rec><Rec>1910 1943 2433 823 3261 3407 2267 2971 3600 1024 2164 3010 60 3598 1669 4023 3378 3354 2393 573 4086 3511 708 2310 281 689 2786 629 2983 1710 3026 2855</Rec><Rec>3539 2011 2367 55 3229 425 1903 3997 3360 1543 2638 1332 362 380 3227 3980 360 357 3095 175 3895 1492 702 531 3863 3196 1289 2257 3684 1324 1360 1851</Rec><Rec>1910 1943 282 2511 3202 3407 652 2971 3600 894 3822 3010 1188 2268 1669 2057 3378 500 2393 2103 4086 3511 1635 2310 2640 689 2786 2159 2983 1710 3422 866</Rec><Rec>3539 2011 403 55 3229 425 1903 3997 3360 1543 2638 1332 362 2625 3227 3980 360 3280 3095 175 3895 1492 702 1244 3863 1319 2521 2257 1530 2561 1360 1851</Rec><Rec>1735 1943 282 2564 1570 3381 652 1874 3600 894 2164 2139 1188 2268 3244 1737 2949 374 2393 2873 2019 3502 1635 3781 2409 704 3896 2159 3332 1710 3422 866</Rec><Rec>3539 2011 1592 55 3229 425 1903 3997 3360 1543 2638 1332 362 2625 3227 3980 360 3280 721 448 2124 1492 702 2893 3863 1819 1707 3391 2420 3644 962 1851</Rec><Rec>1735 1943 282 2564 1570 3381 652 1874 2864 275 2164 2542 1188 2268 3244 1737 2949 374 1797 2103 4086 19 3421 1609 1152 3281 3896 629 1114 963 3422 866</Rec><Rec>1990 2991 460 55 3229 270 1903 3997 3360 1543 2638 1332 362 2625 3227 3980 360 1396 721 1507 2124 2891 702 1244 3863 3943 1489 3391 1806 3644 962 4089</Rec><Rec>168 1943 282 3753 1713 112 652 2981 3656 1347 2164 1188 60 304 901 1737 368 374 3105 2103 4086 19 3421 1609 902 1822 1468 629 3727 963 3422 2594</Rec><Rec>2014 2991 842 55 3229 270 3629 3997 3360 1543 2638 1332 362 1527 3227 3980 360 61 721 1507 2124 1807 702 1244 3863 733 3693 2253 4 3644 962 1851</Rec><Rec>1851 1943 282 4045 2016 2400 1393 2981 2960 2213 2164 3484 60 304 901 2709 2671 134 1833 504 4086 438 173 2483 902 1240 415 629 1258 963 2895 1980</Rec><Rec>2014 3805 842 55 3229 270 3629 3997 3360 1543 2638 1332 362 1527 3227 3980 3042 3835 253 1507 2606 1807 702 1244 1476 2600 3693 2253 3625 3644 962 1851</Rec><Rec>1851 170 2801 1171 4023 79 1393 1374 2960 3573 218 3484 60 2786 901 960 2248 2747 3402 509 4086 438 2526 1262 2517 1240 415 629 3760 963 2495 1263</Rec><Rec>2014 3805 460 55 3229 270 3629 3997 3360 1543 3270 1332 362 1527 3227 3980 3042 3835 2134 1507 2606 2015 702 1244 1476 3785 2521 947 906 4087 962 1851</Rec><Rec>455 2700 976 1905 1779 3902 1770 1280 2960 1966 218 1283 60 2740 40 2001 2248 3488 3954 2290 4086 438 2134 1760 2337 1712 450 2159 575 963 2628 2568</Rec><Rec>2936 3805 403 55 1967 3326 3629 3997 3360 1543 3270 1332 362 1527 3227 3980 3042 2073 3265 175 2606 735 702 1244 1476 3372 2521 3391 2437 1115 999 1851</Rec><Rec>2171 2700 3440 3483 2057 2777 437 2458 2960 3101 218 54 60 3893 2446 3848 3757 3488 1865 2290 4086 3963 2824 3918 2233 1712 2869 2159 430 2568 1878 3475</Rec>."
+```
+
+**WM Format (World Model - Predict Future):**
+```text
+role"user"
+content"<image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image><image>Task: put the white mug on the left plate and put the yellow and white mug on the right plate. Based on the images, If we execute the action<Act>300 496 1179 273 469 265 398 289 482 278 972 953 360 416 413 262 258</Act>, what will be the resulting state?"
+role"assistant"
+content"After executing<Act>300 496 1179 273 469 265 398 289 482 278 972 953 360 416 413 262 258</Act>, the system will transition to the state<Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 3010 60 3598 1683 1003 1543 615 2393 3730 4086 2406 4004 764 1721 951 3008 629 713 740 1972 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 1602 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 3010 60 3598 2788 1003 1543 615 2393 248 4086 2406 4004 764 1721 689 3008 629 3711 740 1972 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 954 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 565 60 3598 1683 1003 1543 615 2393 248 4086 2406 4004 764 1721 689 2786 629 3711 740 1972 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1143 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 954 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 3426 703 2864 2298 2164 565 60 3598 1669 1003 1543 615 2393 3730 4086 2406 4004 764 1721 689 3008 629 1944 740 3168 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 1708 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2456 3588 3407 3426 703 2864 2298 2164 3010 60 3598 1683 1846 1543 615 2393 248 4086 2406 4004 764 1721 689 2786 629 713 963 1739 3331</Rec><Rec>621 3159 3488 55 3229 425 786 3997 3360 1543 2638 1332 362 3412 3227 3639 360 1044 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 3156 2511 3588 3407 652 703 2864 1024 2164 3010 60 3598 1669 1846 1543 615 2393 248 4086 2406 4004 764 1721 689 2786 629 713 963 1739 3331</Rec><Rec>621 3159 2367 55 3229 425 941 3997 3360 1543 2638 1332 362 1708 3227 3639 360 3172 3095 175 2124 1492 702 531 3863 384 1289 2257 3309 4087 1360 1851</Rec><Rec>142 1943 282 823 3588 3407 2267 257 2864 1024 2164 3010 60 3598 1669 1846 1543 615 2393 248 4086 3511 708 3972 1721 689 2786 629 2983 1710 1739 3331</Rec><Rec>621 3159 2367 55 3229 425 941 3997 3360 1543 2638 3131 362 1708 3227 3639 360 1660 3095 175 263 1492 702 531 3863 3319 1289 2257 1029 1672 1360 1851</Rec><Rec>1910 1943 2433 823 3261 3407 2267 2971 3600 1024 2164 3010 60 3598 1669 4023 3378 3354 2393 573 4086 3511 708 2310 281 689 2786 629 2983 1710 3026 2855</Rec><Rec>3539 2011 2367 55 3229 425 1903 3997 3360 1543 2638 1332 362 380 3227 3980 360 357 3095 175 3895 1492 702 531 3863 3196 1289 2257 3684 1324 1360 1851</Rec><Rec>1910 1943 282 2511 3202 3407 652 2971 3600 894 3822 3010 1188 2268 1669 2057 3378 500 2393 2103 4086 3511 1635 2310 2640 689 2786 2159 2983 1710 3422 866</Rec><Rec>3539 2011 403 55 3229 425 1903 3997 3360 1543 2638 1332 362 2625 3227 3980 360 3280 3095 175 3895 1492 702 1244 3863 1319 2521 2257 1530 2561 1360 1851</Rec><Rec>1735 1943 282 2564 1570 3381 652 1874 3600 894 2164 2139 1188 2268 3244 1737 2949 374 2393 2873 2019 3502 1635 3781 2409 704 3896 2159 3332 1710 3422 866</Rec><Rec>3539 2011 1592 55 3229 425 1903 3997 3360 1543 2638 1332 362 2625 3227 3980 360 3280 721 448 2124 1492 702 2893 3863 1819 1707 3391 2420 3644 962 1851</Rec><Rec>1735 1943 282 2564 1570 3381 652 1874 2864 275 2164 2542 1188 2268 3244 1737 2949 374 1797 2103 4086 19 3421 1609 1152 3281 3896 629 1114 963 3422 866</Rec><Rec>1990 2991 460 55 3229 270 1903 3997 3360 1543 2638 1332 362 2625 3227 3980 360 1396 721 1507 2124 2891 702 1244 3863 3943 1489 3391 1806 3644 962 4089</Rec><Rec>168 1943 282 3753 1713 112 652 2981 3656 1347 2164 1188 60 304 901 1737 368 374 3105 2103 4086 19 3421 1609 902 1822 1468 629 3727 963 3422 2594</Rec><Rec>2014 2991 842 55 3229 270 3629 3997 3360 1543 2638 1332 362 1527 3227 3980 360 61 721 1507 2124 1807 702 1244 3863 733 3693 2253 4 3644 962 1851</Rec><Rec>1851 1943 282 4045 2016 2400 1393 2981 2960 2213 2164 3484 60 304 901 2709 2671 134 1833 504 4086 438 173 2483 902 1240 415 629 1258 963 2895 1980</Rec><Rec>2014 3805 842 55 3229 270 3629 3997 3360 1543 2638 1332 362 1527 3227 3980 3042 3835 253 1507 2606 1807 702 1244 1476 2600 3693 2253 3625 3644 962 1851</Rec><Rec>1851 170 2801 1171 4023 79 1393 1374 2960 3573 218 3484 60 2786 901 960 2248 2747 3402 509 4086 438 2526 1262 2517 1240 415 629 3760 963 2495 1263</Rec><Rec>2014 3805 460 55 3229 270 3629 3997 3360 1543 3270 1332 362 1527 3227 3980 3042 3835 2134 1507 2606 2015 702 1244 1476 3785 2521 947 906 4087 962 1851</Rec><Rec>455 2700 976 1905 1779 3902 1770 1280 2960 1966 218 1283 60 2740 40 2001 2248 3488 3954 2290 4086 438 2134 1760 2337 1712 450 2159 575 963 2628 2568</Rec><Rec>2936 3805 403 55 1967 3326 3629 3997 3360 1543 3270 1332 362 1527 3227 3980 3042 2073 3265 175 2606 735 702 1244 1476 3372 2521 3391 2437 1115 999 1851</Rec><Rec>2171 2700 3440 3483 2057 2777 437 2458 2960 3101 218 54 60 3893 2446 3848 3757 3488 1865 2290 4086 3963 2824 3918 2233 1712 2869 2159 430 2568 1878 3475</Rec>."
+```
+
+---
+
+Once both datasets are prepared, you can proceed to the training phase.
+
+### 🎯 Training
+
+With all preparations complete, launch the FUTURE-VLA training process using the following configuration:
+
+**Training Configuration:**
+- Batch size: 8 per GPU (~135GB memory per GPU)
+- Backbone: Qwen3-4B with DINOv3 vision encoder
+- Training mode: Full fine-tuning (unfrozen vision, aligner, and LLM)
+
+```bash
+python -m torch.distributed.run --nproc_per_node 8 \
+  /.venv/lib/python3.11/site-packages/swift/cli/sft.py \
+  --model your/path/to/Qwen3vl+dinov3 \
+  --resume_from_checkpoint your/path/to/checkpoint \
+  --output_dir your/path/to/output_dir \
+  --train_type full \
+  --freeze_vit false --freeze_aligner false --freeze_llm false \
+  --trainable_parameters_regex ".*" \
+  --dataset your/path/to/dataset/data \
+  --torch_dtype bfloat16 \
+  --num_train_epochs 2 \
+  --per_device_train_batch_size 8 \
+  --learning_rate 1e-4 \
+  --warmup_steps 1000 \
+  --save_steps 5000 \
+  --logging_steps 100 \
+  --dataloader_num_workers 10 \
+  --model_author swift --model_name swift-robot \
+  --ddp_find_unused_parameters true \
+  --gradient_checkpointing true \
+  --gradient_checkpointing_kwargs '{"use_reentrant": false}'
+```
