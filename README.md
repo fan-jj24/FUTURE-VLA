@@ -65,3 +65,18 @@ We are currently organizing and reviewing the code and model checkpoints for Rob
 ### 🌍 Real-World Evaluation
 
 We are currently organizing and reviewing the code and model checkpoints for real-world robot evaluation. Stay tuned for the upcoming release!
+
+# Bibtex
+
+Please consider citing our paper if this repository helps your research:
+```
+@misc{fan2026futurevlaforecastingunifiedtrajectories,
+      title={FUTURE-VLA: Forecasting Unified Trajectories Under Real-time Execution}, 
+      author={Jingjing Fan and Yushan Liu and Shoujie Li and Botao Ren and Siyuan Li and Xiao-Ping Zhang and Wenbo Ding and Zhidong Deng},
+      year={2026},
+      eprint={2602.15882},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2602.15882}, 
+}
+```
